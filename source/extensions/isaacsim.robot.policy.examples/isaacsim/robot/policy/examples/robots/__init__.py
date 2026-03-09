@@ -18,3 +18,4 @@ from isaacsim.robot.policy.examples.robots.anymal import AnymalFlatTerrainPolicy
 from isaacsim.robot.policy.examples.robots.franka import FrankaOpenDrawerPolicy
 from isaacsim.robot.policy.examples.robots.h1 import H1FlatTerrainPolicy
 from isaacsim.robot.policy.examples.robots.spot import SpotFlatTerrainPolicy
+from isaacsim.robot.policy.examples.robots.ur10e import UR10eReachTargetPolicy
