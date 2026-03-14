@@ -44,6 +44,8 @@ parser.add_argument("--cube_x", type=float, default=0.5, help="Cube spawn X [tra
 parser.add_argument("--cube_y", type=float, default=0.0, help="Cube spawn Y [trained: 0.0]")
 parser.add_argument("--cube_z", type=float, default=0.055, help="Cube spawn Z [trained: 0.055]")
 parser.add_argument("--no_clamp", action="store_true", help="Disable clamping to training distribution (use at own risk)")
+parser.add_argument("--vel_scale", type=float, default=1.0,
+                    help="Multiply all velocity_limit_sim by this factor (default: 1.0 = training values)")
 parser.add_argument("--verbose", action="store_true", help="Enable per-step diagnostic logging")
 parser.add_argument("--log_interval", type=int, default=10, help="Steps between verbose log lines (default: 10)")
 args = parser.parse_args()
@@ -96,13 +98,26 @@ EE_BODY_OFFSET_POS = np.array([0.0, 0.0, 0.24])
 EE_BODY_OFFSET_ROT = np.array([1.0, 0.0, 0.0, 0.0])  # wxyz identity
 
 JOINT_DRIVE_CONFIG = {
-    "shoulder_pan_joint": {"stiffness": 2000.0, "damping": 100.0},
-    "shoulder_lift_joint": {"stiffness": 2000.0, "damping": 100.0},
-    "elbow_joint": {"stiffness": 1000.0, "damping": 60.0},
-    "wrist_1_joint": {"stiffness": 500.0, "damping": 40.0},
-    "wrist_2_joint": {"stiffness": 500.0, "damping": 40.0},
-    "wrist_3_joint": {"stiffness": 500.0, "damping": 40.0},
-    "finger_joint": {"stiffness": 2000.0, "damping": 100.0},
+    # Shoulder group (shoulder_.*)  -- effort_limit_sim: null (USD default)
+    "shoulder_pan_joint":  {"stiffness": 2000.0, "damping": 100.0, "max_velocity": 2.0},
+    "shoulder_lift_joint": {"stiffness": 2000.0, "damping": 100.0, "max_velocity": 2.0},
+    # Elbow  -- effort_limit_sim: null (USD default)
+    "elbow_joint":         {"stiffness": 1000.0, "damping": 60.0,  "max_velocity": 2.5},
+    # Wrist group (wrist_.*)  -- effort_limit_sim: null (USD default)
+    "wrist_1_joint":       {"stiffness": 500.0,  "damping": 40.0,  "max_velocity": 3.0},
+    "wrist_2_joint":       {"stiffness": 500.0,  "damping": 40.0,  "max_velocity": 3.0},
+    "wrist_3_joint":       {"stiffness": 500.0,  "damping": 40.0,  "max_velocity": 3.0},
+    # Gripper: finger_joint  -- effort_limit_sim: 200.0
+    "finger_joint":        {"stiffness": 2000.0, "damping": 100.0, "max_velocity": 10.0, "max_effort": 200.0},
+    # Gripper sub-joints: inner_finger  -- effort_limit_sim: 50.0
+    "left_inner_finger_joint":  {"stiffness": 100.0, "damping": 10.0, "max_velocity": 10.0, "max_effort": 50.0},
+    "right_inner_finger_joint": {"stiffness": 100.0, "damping": 10.0, "max_velocity": 10.0, "max_effort": 50.0},
+    # Gripper sub-joints: passive linkage  -- effort_limit_sim: 1.0
+    "right_outer_knuckle_joint":    {"stiffness": 0.0, "damping": 0.0, "max_velocity": 10.0, "max_effort": 1.0},
+    "left_outer_finger_joint":      {"stiffness": 0.0, "damping": 0.0, "max_velocity": 10.0, "max_effort": 1.0},
+    "right_outer_finger_joint":     {"stiffness": 0.0, "damping": 0.0, "max_velocity": 10.0, "max_effort": 1.0},
+    "left_inner_finger_pad_joint":  {"stiffness": 0.0, "damping": 0.0, "max_velocity": 10.0, "max_effort": 1.0},
+    "right_inner_finger_pad_joint": {"stiffness": 0.0, "damping": 0.0, "max_velocity": 10.0, "max_effort": 1.0},
 }
 
 # ============================================================================
@@ -199,7 +214,7 @@ def setup_scene(cube_pos: np.ndarray):
     light_prim.GetAttribute("inputs:color").Set(Gf.Vec3f(0.75, 0.75, 0.75))
 
 
-def configure_physics():
+def configure_physics(vel_scale: float = 1.0):
     """Set articulation solver properties and joint drives to match training config."""
     stage = simulation_app.context.get_stage()
     robot_prim = get_prim_at_path("/World/Robot")
@@ -225,22 +240,45 @@ def configure_physics():
             physx_rb.GetDisableGravityAttr().Set(True)
             physx_rb.GetMaxDepenetrationVelocityAttr().Set(5.0)
 
-    # Apply joint drive stiffness/damping from training config
+    # Apply joint drive stiffness/damping and velocity limits from training config
+    joint_prim_cache = {}
+    for prim in stage.Traverse():
+        prim_path_str = str(prim.GetPath())
+        if prim_path_str.startswith("/World/Robot") and prim.GetName() in JOINT_DRIVE_CONFIG:
+            joint_prim_cache[prim.GetName()] = prim
+
+    configured = 0
     for joint_name, drive_cfg in JOINT_DRIVE_CONFIG.items():
-        joint_prim = None
-        for prim in stage.Traverse():
-            if prim.GetName() == joint_name and str(prim.GetPath()).startswith("/World/Robot"):
-                joint_prim = prim
-                break
+        joint_prim = joint_prim_cache.get(joint_name)
         if joint_prim is None:
             print(f"[WARN] Joint prim not found for drive config: {joint_name}")
             continue
+
+        # Stiffness and damping via DriveAPI
         drive_api = UsdPhysics.DriveAPI.Get(joint_prim, "angular")
         if not drive_api:
             drive_api = UsdPhysics.DriveAPI.Apply(joint_prim, "angular")
         drive_api.GetStiffnessAttr().Set(drive_cfg["stiffness"])
         drive_api.GetDampingAttr().Set(drive_cfg["damping"])
-    print(f"[INFO] Applied joint drives for {len(JOINT_DRIVE_CONFIG)} joints")
+
+        # Effort limit (max torque the PD controller can exert)
+        max_effort = drive_cfg.get("max_effort")
+        if max_effort is not None:
+            drive_api.GetMaxForceAttr().Set(max_effort)
+
+        # Velocity limit via PhysxJointAPI (scaled by vel_scale)
+        max_vel = drive_cfg.get("max_velocity")
+        if max_vel is not None:
+            scaled_vel = max_vel * vel_scale
+            if joint_prim.HasAPI(PhysxSchema.PhysxJointAPI):
+                physx_joint = PhysxSchema.PhysxJointAPI(joint_prim)
+            else:
+                physx_joint = PhysxSchema.PhysxJointAPI.Apply(joint_prim)
+            physx_joint.GetMaxJointVelocityAttr().Set(scaled_vel)
+
+        configured += 1
+    print(f"[INFO] Configured {configured}/{len(JOINT_DRIVE_CONFIG)} joints "
+          f"(stiffness, damping, velocity limits x{vel_scale:.1f}, effort limits)")
 
 
 # ============================================================================
@@ -270,6 +308,8 @@ class UR10ePickPlaceInference:
 
         # State buffers (initialized in initialize())
         self.prev_action = np.zeros(7, dtype=np.float32)
+        self._arm_cmd = np.zeros(6, dtype=np.float32)
+        self._gripper_cmd = 0.0
         self.default_joint_pos = None
         self.default_joint_vel = None
         self.robot = None
@@ -434,10 +474,15 @@ class UR10ePickPlaceInference:
 
         return None
 
-    def step(self):
-        """Execute one policy inference step and apply actions to the robot.
+    def compute_policy(self):
+        """Run the neural-network policy once to get a new action.
 
-        Returns a dict of diagnostics for the current step.
+        This sets the IK goal and gripper command. The actual IK solve
+        happens in apply_ik_substep() which should be called every physics
+        sub-step (DECIMATION times per policy step) -- matching Arena's
+        closed-loop IK servo.
+
+        Returns a dict of diagnostics.
         """
         self.total_steps += 1
 
@@ -448,65 +493,30 @@ class UR10ePickPlaceInference:
 
         self.prev_action = action.copy().astype(np.float32)
 
-        arm_cmd = action[:6]
-        gripper_cmd = action[6]
+        self._arm_cmd = action[:6]
+        self._gripper_cmd = action[6]
 
-        # --- Arm: Differential IK ---
+        # Set the IK goal once using the current EE pose
         ee_pos, ee_quat = self._get_ee_pose()
         ee_pos_t = torch.tensor(ee_pos, dtype=torch.float32, device=self.device).unsqueeze(0)
         ee_quat_t = torch.tensor(ee_quat, dtype=torch.float32, device=self.device).unsqueeze(0)
-        arm_cmd_t = torch.tensor(arm_cmd, dtype=torch.float32, device=self.device).unsqueeze(0)
-
+        arm_cmd_t = torch.tensor(self._arm_cmd, dtype=torch.float32, device=self.device).unsqueeze(0)
         self.ik_solver.set_command(arm_cmd_t, ee_pos_t, ee_quat_t)
 
-        jacobian = self._get_jacobian()
-        current_arm_pos = np.array(
-            [self.robot.get_joint_positions()[i] for i in self.arm_joint_indices], dtype=np.float32
-        )
-        current_arm_pos_t = torch.tensor(current_arm_pos, device=self.device).unsqueeze(0)
+        # Run the first IK solve + apply for sub-step 0
+        diag = self.apply_ik_substep()
 
-        target_arm_pos = self.ik_solver.compute(
-            ee_pos_t, ee_quat_t, jacobian, current_arm_pos_t
-        ).cpu().numpy().flatten()
-
-        # --- Gripper: proximity-based ---
-        cube_pos, _ = self.cube.get_world_pose()
-        ee_to_cube = np.linalg.norm(np.array(ee_pos) - np.array(cube_pos))
-        if ee_to_cube < GRIPPER_CLOSE_THRESHOLD and gripper_cmd > 0:
-            target_finger = GRIPPER_CLOSE_POS
-        else:
-            target_finger = GRIPPER_OPEN_POS
-
-        # --- Apply joint targets ---
-        joint_targets = np.array(self.robot.get_joint_positions(), dtype=np.float64)
-        for i, arm_idx in enumerate(self.arm_joint_indices):
-            joint_targets[arm_idx] = float(target_arm_pos[i])
-        joint_targets[self.finger_joint_idx] = target_finger
-
-        self.robot.apply_action(ArticulationAction(joint_positions=joint_targets))
-
-        # --- Diagnostics ---
-        ee_pos_np = np.array(ee_pos, dtype=np.float32)
-        ee_quat_np = np.array(ee_quat, dtype=np.float32)
-        cube_pos_np = np.array(cube_pos, dtype=np.float32)
-        cube_goal_dist = float(np.linalg.norm(cube_pos_np - self.goal_pos))
-
-        diag = {
-            "ee_pos": ee_pos_np, "ee_quat": ee_quat_np,
-            "cube_pos": cube_pos_np,
-            "ee_cube_dist": float(ee_to_cube), "cube_goal_dist": cube_goal_dist,
-            "finger_target": target_finger, "ee_to_cube_raw": float(ee_to_cube),
-            "gripper_cmd": float(gripper_cmd), "action": action,
-            "ik_target": target_arm_pos,
-        }
-
+        # OOD check
         ood = self.check_ood_status()
         if ood and not self._ood_warned:
             print(f"[OOD] {ood} at step {self.total_steps} -- policy is operating out-of-distribution")
             self._ood_warned = True
 
+        # Verbose logging (once per policy step, not per sub-step)
         should_log = self.verbose and (self.total_steps % self.log_interval == 0)
         if should_log:
+            ee_pos_np = diag["ee_pos"]
+            cube_pos_np = diag["cube_pos"]
             jp_rel = np.array(self.robot.get_joint_positions(), dtype=np.float32) - self.default_joint_pos
             arm_jp_rel = jp_rel[self.arm_joint_indices]
             ik_des_pos = self.ik_solver.ee_pos_des
@@ -523,8 +533,8 @@ class UR10ePickPlaceInference:
                 f"{action[3]:+.3f},{action[4]:+.3f},{action[5]:+.3f}|g{action[6]:+.3f}] "
                 f"EE=({ee_pos_np[0]:.3f},{ee_pos_np[1]:.3f},{ee_pos_np[2]:.3f}) "
                 f"Cube=({cube_pos_np[0]:.3f},{cube_pos_np[1]:.3f},{cube_pos_np[2]:.3f}) "
-                f"dist_ee_cube={ee_to_cube:.4f} dist_cube_goal={cube_goal_dist:.4f} "
-                f"finger={target_finger:.2f} "
+                f"dist_ee_cube={diag['ee_cube_dist']:.4f} dist_cube_goal={diag['cube_goal_dist']:.4f} "
+                f"finger={diag['finger_target']:.2f} "
                 f"arm_jp_rel=[{arm_jp_rel[0]:+.3f},{arm_jp_rel[1]:+.3f},{arm_jp_rel[2]:+.3f},"
                 f"{arm_jp_rel[3]:+.3f},{arm_jp_rel[4]:+.3f},{arm_jp_rel[5]:+.3f}]"
             )
@@ -532,13 +542,17 @@ class UR10ePickPlaceInference:
                 print(des_str)
 
         if self._csv_writer:
+            ee_pos_np = diag["ee_pos"]
+            ee_quat_np = diag["ee_quat"]
+            cube_pos_np = diag["cube_pos"]
+            target_arm_pos = diag["ik_target"]
             self._csv_writer.writerow([
                 self.total_steps,
                 f"{ee_pos_np[0]:.5f}", f"{ee_pos_np[1]:.5f}", f"{ee_pos_np[2]:.5f}",
                 f"{ee_quat_np[0]:.5f}", f"{ee_quat_np[1]:.5f}", f"{ee_quat_np[2]:.5f}", f"{ee_quat_np[3]:.5f}",
                 f"{cube_pos_np[0]:.5f}", f"{cube_pos_np[1]:.5f}", f"{cube_pos_np[2]:.5f}",
-                f"{ee_to_cube:.5f}", f"{cube_goal_dist:.5f}",
-                f"{target_finger:.3f}", f"{ee_to_cube:.5f}", f"{gripper_cmd:.5f}",
+                f"{diag['ee_cube_dist']:.5f}", f"{diag['cube_goal_dist']:.5f}",
+                f"{diag['finger_target']:.3f}", f"{diag['ee_to_cube_raw']:.5f}", f"{self._gripper_cmd:.5f}",
                 f"{action[0]:.5f}", f"{action[1]:.5f}", f"{action[2]:.5f}",
                 f"{action[3]:.5f}", f"{action[4]:.5f}", f"{action[5]:.5f}", f"{action[6]:.5f}",
                 f"{target_arm_pos[0]:.5f}", f"{target_arm_pos[1]:.5f}", f"{target_arm_pos[2]:.5f}",
@@ -547,6 +561,63 @@ class UR10ePickPlaceInference:
             ])
 
         return diag
+
+    def apply_ik_substep(self) -> dict:
+        """Re-solve IK with the current EE state and apply joint targets.
+
+        Called every physics sub-step within the decimation window.
+        This is the closed-loop IK servo that matches how IsaacLab-Arena's
+        DifferentialIKController.compute() is called at every env sub-step.
+        The IK goal (ee_pos_des / ee_quat_des) was already set once by
+        compute_policy(); here we just re-solve from the latest joint state.
+
+        Returns a diagnostics dict.
+        """
+        ee_pos, ee_quat = self._get_ee_pose()
+        ee_pos_t = torch.tensor(ee_pos, dtype=torch.float32, device=self.device).unsqueeze(0)
+        ee_quat_t = torch.tensor(ee_quat, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        jacobian = self._get_jacobian()
+        current_arm_pos = np.array(
+            [self.robot.get_joint_positions()[i] for i in self.arm_joint_indices], dtype=np.float32
+        )
+        current_arm_pos_t = torch.tensor(current_arm_pos, device=self.device).unsqueeze(0)
+
+        target_arm_pos = self.ik_solver.compute(
+            ee_pos_t, ee_quat_t, jacobian, current_arm_pos_t
+        ).cpu().numpy().flatten()
+
+        # Gripper: proximity-based
+        cube_pos, _ = self.cube.get_world_pose()
+        ee_to_cube = np.linalg.norm(np.array(ee_pos) - np.array(cube_pos))
+        if ee_to_cube < GRIPPER_CLOSE_THRESHOLD and self._gripper_cmd > 0:
+            target_finger = GRIPPER_CLOSE_POS
+        else:
+            target_finger = GRIPPER_OPEN_POS
+
+        # Apply joint targets
+        joint_targets = np.array(self.robot.get_joint_positions(), dtype=np.float64)
+        for i, arm_idx in enumerate(self.arm_joint_indices):
+            joint_targets[arm_idx] = float(target_arm_pos[i])
+        joint_targets[self.finger_joint_idx] = target_finger
+
+        self.robot.apply_action(ArticulationAction(joint_positions=joint_targets))
+
+        # Diagnostics
+        ee_pos_np = np.array(ee_pos, dtype=np.float32)
+        ee_quat_np = np.array(ee_quat, dtype=np.float32)
+        cube_pos_np = np.array(cube_pos, dtype=np.float32)
+        cube_goal_dist = float(np.linalg.norm(cube_pos_np - self.goal_pos))
+
+        return {
+            "ee_pos": ee_pos_np, "ee_quat": ee_quat_np,
+            "cube_pos": cube_pos_np,
+            "ee_cube_dist": float(ee_to_cube), "cube_goal_dist": cube_goal_dist,
+            "finger_target": target_finger, "ee_to_cube_raw": float(ee_to_cube),
+            "gripper_cmd": float(self._gripper_cmd),
+            "action": self.prev_action,
+            "ik_target": target_arm_pos,
+        }
 
 
 # ============================================================================
@@ -568,6 +639,8 @@ def main():
     print(f"    Z: [{CUBE_Z_RANGE[0]:.3f}, {CUBE_Z_RANGE[1]:.3f}]")
     print(f"  Trained cube default: {CUBE_TRAINED_POS}")
     print(f"  Clamping: {'ON' if do_clamp else 'OFF (--no_clamp)'}")
+    vel_str = f"{args.vel_scale:.1f}x" if args.vel_scale != 1.0 else "1.0x (training default)"
+    print(f"  Velocity scale: {vel_str}")
     print(f"  Verbose: {'ON (interval={args.log_interval})' if args.verbose else 'OFF'}")
     print("=" * 68)
 
@@ -600,7 +673,7 @@ def main():
     )
 
     setup_scene(cube_pos=cube_spawn_pos)
-    configure_physics()
+    configure_physics(vel_scale=args.vel_scale)
 
     world.reset()
     simulation_app.update()
@@ -632,6 +705,7 @@ def main():
 
     print(f"[INFO] Goal position: ({goal_pos[0]:.3f}, {goal_pos[1]:.3f}, {goal_pos[2]:.3f})")
     print(f"[INFO] Decimation: {DECIMATION} (policy runs every {DECIMATION} physics steps)")
+    print(f"[INFO] IK servo: closed-loop (re-solved every physics sub-step, matching Arena)")
     print(f"[INFO] Running inference (max {args.num_steps} policy steps)...")
 
     while simulation_app.is_running() and inference.total_steps < args.num_steps:
@@ -639,14 +713,18 @@ def main():
             world.step(render=True)
             continue
 
-        # Policy inference: compute action once
-        diag = inference.step()
+        # Policy inference: compute action once, also does first IK solve + apply
+        diag = inference.compute_policy()
 
-        # Apply the same action for DECIMATION physics steps (matches training)
-        for dec_step in range(DECIMATION):
-            world.step(render=(dec_step == DECIMATION - 1))
+        # First physics sub-step (action already applied by compute_policy)
+        world.step(render=(DECIMATION == 1))
+
+        # Remaining DECIMATION-1 sub-steps: re-solve IK each time (closed-loop servo)
+        for dec_step in range(1, DECIMATION):
             if world.is_stopped():
                 break
+            inference.apply_ik_substep()
+            world.step(render=(dec_step == DECIMATION - 1))
 
         if world.is_stopped():
             break
