@@ -319,11 +319,15 @@ class UR10ePickPlaceInference:
         self.arm_joint_indices = [joint_names.index(n) for n in ARM_JOINT_NAMES]
         self.finger_joint_idx = joint_names.index("finger_joint")
 
-        self.default_joint_pos = np.zeros(self.num_joints, dtype=np.float32)
+        # Read the USD-default joint positions before we override the arm.
+        # This preserves the gripper joints' native defaults.
+        usd_defaults = np.array(self.robot.get_joint_positions(), dtype=np.float32)
+        self.default_joint_pos = usd_defaults.copy()
         for i, name in enumerate(ARM_JOINT_NAMES):
             self.default_joint_pos[self.arm_joint_indices[i]] = DEFAULT_ARM_POSE[i]
         self.default_joint_vel = np.zeros(self.num_joints, dtype=np.float32)
 
+        print(f"[INFO] Default joint positions (USD → overridden arm): {self.default_joint_pos.tolist()}")
         self.robot.set_joint_positions(self.default_joint_pos)
 
         self.wrist_3_link_prim = get_prim_at_path("/World/Robot/wrist_3_link")
@@ -349,7 +353,13 @@ class UR10ePickPlaceInference:
         )
 
     def _get_jacobian(self) -> torch.Tensor:
-        """Get geometric Jacobian for the 6 arm joints w.r.t. wrist_3_link.
+        """Get geometric Jacobian for the 6 arm joints w.r.t. the EE frame.
+
+        The raw Jacobian from PhysX is for wrist_3_link. IsaacLab applies a
+        body-offset correction to shift it to the actual EE point (0,0,0.24)
+        above wrist_3_link. We replicate that here:
+          J_trans += -skew(offset_pos) @ J_rot
+          J_rot   =  R_offset @ J_rot   (identity rotation, so no-op)
 
         Returns shape (1, 6, 6): one env, 6 task-space dims, 6 arm joints.
         """
@@ -357,7 +367,19 @@ class UR10ePickPlaceInference:
         jac_np = jac_all.numpy()
         jac_ee = jac_np[0, self._jac_link_idx - 1, :, :]
         jac_arm = jac_ee[:, self.arm_joint_indices]
-        return torch.tensor(jac_arm, dtype=torch.float32, device=self.device).unsqueeze(0)
+        jacobian = torch.tensor(jac_arm, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        offset = torch.tensor(EE_BODY_OFFSET_POS, dtype=torch.float32, device=self.device)
+        skew = torch.zeros(3, 3, device=self.device)
+        skew[0, 1] = -offset[2]
+        skew[0, 2] = offset[1]
+        skew[1, 0] = offset[2]
+        skew[1, 2] = -offset[0]
+        skew[2, 0] = -offset[1]
+        skew[2, 1] = offset[0]
+        jacobian[:, 0:3, :] += torch.bmm((-skew).unsqueeze(0), jacobian[:, 3:, :])
+
+        return jacobian
 
     def _compute_observation(self) -> torch.Tensor:
         """Build observation vector matching the training env.
@@ -609,27 +631,37 @@ def main():
               f"Consider adjusting spawn Z to {cube_rest_pos[2]:.4f}.")
 
     print(f"[INFO] Goal position: ({goal_pos[0]:.3f}, {goal_pos[1]:.3f}, {goal_pos[2]:.3f})")
-    print(f"[INFO] Running inference (max {args.num_steps} total steps)...")
+    print(f"[INFO] Decimation: {DECIMATION} (policy runs every {DECIMATION} physics steps)")
+    print(f"[INFO] Running inference (max {args.num_steps} policy steps)...")
 
     while simulation_app.is_running() and inference.total_steps < args.num_steps:
-        world.step(render=True)
+        if not world.is_playing():
+            world.step(render=True)
+            continue
 
-        if world.is_playing():
-            diag = inference.step()
+        # Policy inference: compute action once
+        diag = inference.step()
 
-            if inference.total_steps % 200 == 0:
-                print(
-                    f"[Step {inference.total_steps:5d}] "
-                    f"EE->Cube: {diag['ee_cube_dist']:.4f}m | "
-                    f"Cube->Goal: {diag['cube_goal_dist']:.4f}m | "
-                    f"Cube: ({diag['cube_pos'][0]:.3f}, {diag['cube_pos'][1]:.3f}, "
-                    f"{diag['cube_pos'][2]:.3f}) | Finger: {diag['finger_target']:.2f}"
-                )
+        # Apply the same action for DECIMATION physics steps (matches training)
+        for dec_step in range(DECIMATION):
+            world.step(render=(dec_step == DECIMATION - 1))
+            if world.is_stopped():
+                break
 
         if world.is_stopped():
             break
 
-    print(f"[INFO] Done after {inference.total_steps} total steps.")
+        if inference.total_steps % 50 == 0:
+            print(
+                f"[Step {inference.total_steps:5d}] "
+                f"EE->Cube: {diag['ee_cube_dist']:.4f}m | "
+                f"Cube->Goal: {diag['cube_goal_dist']:.4f}m | "
+                f"Cube: ({diag['cube_pos'][0]:.3f}, {diag['cube_pos'][1]:.3f}, "
+                f"{diag['cube_pos'][2]:.3f}) | Finger: {diag['finger_target']:.2f}"
+            )
+
+    print(f"[INFO] Done after {inference.total_steps} policy steps "
+          f"({inference.total_steps * DECIMATION} physics steps).")
     inference.close()
 
 
