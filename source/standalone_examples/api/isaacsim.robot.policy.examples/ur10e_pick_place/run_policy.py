@@ -46,7 +46,6 @@ parser.add_argument("--cube_z", type=float, default=0.055, help="Cube spawn Z [t
 parser.add_argument("--no_clamp", action="store_true", help="Disable clamping to training distribution (use at own risk)")
 parser.add_argument("--verbose", action="store_true", help="Enable per-step diagnostic logging")
 parser.add_argument("--log_interval", type=int, default=10, help="Steps between verbose log lines (default: 10)")
-parser.add_argument("--episode_length", type=int, default=600, help="Per-episode timeout in steps (default: 600)")
 args = parser.parse_args()
 
 # --- Launch IsaacSim ---
@@ -251,8 +250,8 @@ class UR10ePickPlaceInference:
     """Manages observation computation, policy inference, and action application
     for the UR10e pick-and-place task deployed in IsaacSim."""
 
-    def __init__(self, policy_path: str, goal_pos: np.ndarray, cube_spawn_pos: np.ndarray,
-                 episode_length: int = 600, verbose: bool = False, log_interval: int = 10,
+    def __init__(self, policy_path: str, goal_pos: np.ndarray,
+                 verbose: bool = False, log_interval: int = 10,
                  csv_path: str | None = None, device: str = "cpu"):
         self.device = device
 
@@ -265,9 +264,7 @@ class UR10ePickPlaceInference:
 
         self.goal_pos = goal_pos.astype(np.float32)
         self.goal_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        self.cube_spawn_pos = cube_spawn_pos.copy()
 
-        self.episode_length = episode_length
         self.verbose = verbose
         self.log_interval = log_interval
 
@@ -285,10 +282,8 @@ class UR10ePickPlaceInference:
         self._jac_robot = None
         self._jac_link_idx = None
 
-        # Episode tracking
-        self.episode_step = 0
-        self.episode_count = 0
         self.total_steps = 0
+        self._ood_warned = False
 
         # CSV logging
         self._csv_file = None
@@ -297,14 +292,14 @@ class UR10ePickPlaceInference:
             self._csv_file = open(csv_path, "w", newline="")
             self._csv_writer = csv.writer(self._csv_file)
             self._csv_writer.writerow([
-                "total_step", "episode", "ep_step",
+                "total_step",
                 "ee_x", "ee_y", "ee_z", "ee_qw", "ee_qx", "ee_qy", "ee_qz",
                 "cube_x", "cube_y", "cube_z",
                 "ee_cube_dist", "cube_goal_dist",
                 "finger_target", "ee_to_cube_raw", "gripper_cmd",
                 "action_0", "action_1", "action_2", "action_3", "action_4", "action_5", "action_6",
                 "ik_target_j0", "ik_target_j1", "ik_target_j2", "ik_target_j3", "ik_target_j4", "ik_target_j5",
-                "reset_reason",
+                "ood_warning",
             ])
 
     def close(self):
@@ -402,40 +397,10 @@ class UR10ePickPlaceInference:
 
         return torch.from_numpy(obs).unsqueeze(0).to(self.device)
 
-    def reset_episode(self, world, reason: str = ""):
-        """Reset robot and cube to initial state for a new episode."""
-        self.episode_count += 1
-        print(f"[RESET] Episode {self.episode_count} starting (reason: {reason}) "
-              f"at total step {self.total_steps}")
-
-        self.prev_action[:] = 0.0
-        self.episode_step = 0
-
-        self.robot.set_joint_positions(self.default_joint_pos)
-        self.robot.set_joint_velocities(self.default_joint_vel)
-
-        self.cube.set_world_pose(
-            position=self.cube_spawn_pos,
-            orientation=np.array([1.0, 0.0, 0.0, 0.0]),
-        )
-        self.cube.set_linear_velocity(np.zeros(3))
-        self.cube.set_angular_velocity(np.zeros(3))
-
-        for _ in range(5):
-            world.step(render=False)
-
-        if self._csv_writer:
-            self._csv_writer.writerow([
-                self.total_steps, self.episode_count, 0,
-                "", "", "", "", "", "", "",
-                "", "", "", "", "", "", "", "",
-                "", "", "", "", "", "", "",
-                "", "", "", "", "", "",
-                reason,
-            ])
-
-    def check_reset_needed(self) -> str | None:
-        """Return a reset reason string if the episode should end, else None."""
+    def check_ood_status(self) -> str | None:
+        """Check if the scene has gone out-of-distribution. Returns a reason
+        string (logged as a warning) or None. No reset is performed -- this
+        mirrors real-hardware behavior where you cannot teleport objects."""
         cube_pos, _ = self.cube.get_world_pose()
 
         if cube_pos[2] < CUBE_FALL_Z:
@@ -445,17 +410,13 @@ class UR10ePickPlaceInference:
         if goal_dist > CUBE_GOAL_MAX_DIST:
             return f"cube_too_far (dist={goal_dist:.3f})"
 
-        if self.episode_step >= self.episode_length:
-            return f"timeout ({self.episode_length} steps)"
-
         return None
 
-    def step(self, world):
+    def step(self):
         """Execute one policy inference step and apply actions to the robot.
 
         Returns a dict of diagnostics for the current step.
         """
-        self.episode_step += 1
         self.total_steps += 1
 
         obs = self._compute_observation()
@@ -517,7 +478,12 @@ class UR10ePickPlaceInference:
             "ik_target": target_arm_pos,
         }
 
-        should_log = self.verbose and (self.episode_step % self.log_interval == 0)
+        ood = self.check_ood_status()
+        if ood and not self._ood_warned:
+            print(f"[OOD] {ood} at step {self.total_steps} -- policy is operating out-of-distribution")
+            self._ood_warned = True
+
+        should_log = self.verbose and (self.total_steps % self.log_interval == 0)
         if should_log:
             jp_rel = np.array(self.robot.get_joint_positions(), dtype=np.float32) - self.default_joint_pos
             arm_jp_rel = jp_rel[self.arm_joint_indices]
@@ -530,7 +496,7 @@ class UR10ePickPlaceInference:
                 des_str = (f"  IK desired EE: pos=({dp[0]:.4f},{dp[1]:.4f},{dp[2]:.4f}) "
                            f"quat=({dq[0]:.3f},{dq[1]:.3f},{dq[2]:.3f},{dq[3]:.3f})")
             print(
-                f"  [Ep{self.episode_count}|S{self.episode_step:4d}] "
+                f"  [S{self.total_steps:5d}] "
                 f"act=[{action[0]:+.3f},{action[1]:+.3f},{action[2]:+.3f},"
                 f"{action[3]:+.3f},{action[4]:+.3f},{action[5]:+.3f}|g{action[6]:+.3f}] "
                 f"EE=({ee_pos_np[0]:.3f},{ee_pos_np[1]:.3f},{ee_pos_np[2]:.3f}) "
@@ -545,7 +511,7 @@ class UR10ePickPlaceInference:
 
         if self._csv_writer:
             self._csv_writer.writerow([
-                self.total_steps, self.episode_count, self.episode_step,
+                self.total_steps,
                 f"{ee_pos_np[0]:.5f}", f"{ee_pos_np[1]:.5f}", f"{ee_pos_np[2]:.5f}",
                 f"{ee_quat_np[0]:.5f}", f"{ee_quat_np[1]:.5f}", f"{ee_quat_np[2]:.5f}", f"{ee_quat_np[3]:.5f}",
                 f"{cube_pos_np[0]:.5f}", f"{cube_pos_np[1]:.5f}", f"{cube_pos_np[2]:.5f}",
@@ -555,7 +521,7 @@ class UR10ePickPlaceInference:
                 f"{action[3]:.5f}", f"{action[4]:.5f}", f"{action[5]:.5f}", f"{action[6]:.5f}",
                 f"{target_arm_pos[0]:.5f}", f"{target_arm_pos[1]:.5f}", f"{target_arm_pos[2]:.5f}",
                 f"{target_arm_pos[3]:.5f}", f"{target_arm_pos[4]:.5f}", f"{target_arm_pos[5]:.5f}",
-                "",
+                ood or "",
             ])
 
         return diag
@@ -581,7 +547,6 @@ def main():
     print(f"  Trained cube default: {CUBE_TRAINED_POS}")
     print(f"  Clamping: {'ON' if do_clamp else 'OFF (--no_clamp)'}")
     print(f"  Verbose: {'ON (interval={args.log_interval})' if args.verbose else 'OFF'}")
-    print(f"  Episode length: {args.episode_length} steps")
     print("=" * 68)
 
     gx, gy, gz = validate_goal(args.goal_x, args.goal_y, args.goal_z, do_clamp)
@@ -624,8 +589,6 @@ def main():
     inference = UR10ePickPlaceInference(
         policy_path=policy_path,
         goal_pos=goal_pos,
-        cube_spawn_pos=cube_spawn_pos,
-        episode_length=args.episode_length,
         verbose=args.verbose,
         log_interval=args.log_interval,
         csv_path=csv_path,
@@ -648,22 +611,15 @@ def main():
     print(f"[INFO] Goal position: ({goal_pos[0]:.3f}, {goal_pos[1]:.3f}, {goal_pos[2]:.3f})")
     print(f"[INFO] Running inference (max {args.num_steps} total steps)...")
 
-    inference.reset_episode(world, reason="initial")
-
     while simulation_app.is_running() and inference.total_steps < args.num_steps:
         world.step(render=True)
 
         if world.is_playing():
-            diag = inference.step(world)
-
-            reset_reason = inference.check_reset_needed()
-            if reset_reason:
-                inference.reset_episode(world, reason=reset_reason)
+            diag = inference.step()
 
             if inference.total_steps % 200 == 0:
                 print(
-                    f"[Step {inference.total_steps:5d}|Ep{inference.episode_count}|"
-                    f"S{inference.episode_step:4d}] "
+                    f"[Step {inference.total_steps:5d}] "
                     f"EE->Cube: {diag['ee_cube_dist']:.4f}m | "
                     f"Cube->Goal: {diag['cube_goal_dist']:.4f}m | "
                     f"Cube: ({diag['cube_pos'][0]:.3f}, {diag['cube_pos'][1]:.3f}, "
@@ -673,8 +629,7 @@ def main():
         if world.is_stopped():
             break
 
-    print(f"[INFO] Done after {inference.total_steps} total steps, "
-          f"{inference.episode_count} episodes.")
+    print(f"[INFO] Done after {inference.total_steps} total steps.")
     inference.close()
 
 
