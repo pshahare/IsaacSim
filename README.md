@@ -23,6 +23,10 @@ NVIDIA Isaac Sim™ is a simulation platform built on NVIDIA Omniverse, designed
 - [ROS Bridge](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/ros2_tutorials/ros2_landing_page.html): Integration with Robot Operating System (ROS).
 - [Synthetic Data Generation](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/synthetic_data_generation/index.html): Collection of SDG tools
 
+## UR10e use case (this fork)
+
+This fork includes a **UR10e reach/lift policy** and standalone examples. **Start here:** [docs/README_UR10E_AND_ISAAC_SIM.md](docs/README_UR10E_AND_ISAAC_SIM.md) for an overview, technical details (observation/action layout, formulas, inference), and Isaac Sim vs Isaac Lab Arena. To run the example: [docs/RUN_UR10E_USECASE.md](docs/RUN_UR10E_USECASE.md).
+
 ## Documentation
 
 For the latest Isaac Sim documentation, see [Isaac Sim Documentation](https://docs.isaacsim.omniverse.nvidia.com/latest/index.html).
